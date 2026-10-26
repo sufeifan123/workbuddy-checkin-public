@@ -239,29 +239,36 @@ def mask_token(t):
 
 
 def refresh_access_token(rt):
-    """用长效令牌换取新的接口令牌。
-
-    返回 (access_token, new_refresh_token, err)；成功时 err 为 None。
-    该端点不校验 User-Agent，适合云端 / 服务端定时场景。
-    """
+    """用长效令牌换取接口令牌；仅在临时网络故障时最多重试 3 次。"""
     req = urllib.request.Request(PLUGIN_API + REFRESH_PATH, data=b"{}", method="POST")
     req.add_header("Content-Type", "application/json")
     req.add_header("X-Refresh-Token", rt)
     req.add_header("X-Auth-Refresh-Source", "plugin")
     req.add_header("X-Domain", PLUGIN_DOMAIN)
     req.add_header("User-Agent", "WorkBuddy-Checkin-Script/2.1")
-    try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-            body = json.loads(resp.read().decode("utf-8", "replace"))
-    except urllib.error.HTTPError as e:
+
+    for attempt in range(3):
         try:
-            body = json.loads(e.read().decode("utf-8", "replace"))
-        except Exception:
-            return None, None, "HTTP %s" % e.code
-    except urllib.error.URLError as e:
-        return None, None, "网络错误: %s" % e.reason
-    except Exception as e:
-        return None, None, "异常: %s" % str(e)[:200]
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+                body = json.loads(resp.read().decode("utf-8", "replace"))
+            break
+        except urllib.error.HTTPError as e:
+            # 认证失败等确定性 HTTP 错误不重试；临时服务故障才重试。
+            if e.code in (429, 500, 502, 503, 504) and attempt < 2:
+                time.sleep(2 ** (attempt + 1))
+                continue
+            try:
+                body = json.loads(e.read().decode("utf-8", "replace"))
+            except Exception:
+                return None, None, "HTTP %s" % e.code
+            break
+        except (urllib.error.URLError, TimeoutError, socket.timeout) as e:
+            reason = e.reason if isinstance(e, urllib.error.URLError) else e
+            if attempt == 2:
+                return None, None, "网络错误（已尝试 3 次）: %s" % str(reason)[:200]
+            time.sleep(2 ** (attempt + 1))
+        except Exception as e:
+            return None, None, "异常: %s" % str(e)[:200]
 
     if not isinstance(body, dict) or body.get("code") != 0 \
             or not isinstance(body.get("data"), dict):
@@ -274,7 +281,6 @@ def refresh_access_token(rt):
     if not at:
         return None, None, "刷新应答缺少 accessToken"
     return at, new_rt, None
-
 
 def resolve_credential(result):
     """决定本次用哪个凭据，并把来源写进 result['detail']。
